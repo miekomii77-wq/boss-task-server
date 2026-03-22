@@ -9,6 +9,9 @@ const SEC = process.env.SECRETARY_LINE_USER_ID;
 const PORT = process.env.PORT || 3000;
 
 let tasks = [];
+// Track boss reply state: { oderId: taskCode } - when boss is mid-reply
+let bossReplyState = {};
+
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
@@ -32,56 +35,47 @@ async function replyLine(rt, messages) {
 }
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 function fmtDate() { return new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' }); }
-const CE = { urgent: '\u{1F534}', normal: '\u{1F535}', question: '\u{1F4AC}', schedule: '\u{1F4C5}' };
-const CL = { urgent: '\u{1F534} งานด่วน', normal: '\u{1F535} งานทั่วไป', question: '\u{1F4AC} คำถามจากทีม', schedule: '\u{1F4C5} ตารางงาน' };
+const CE = { urgent: '\u{1F534}', normal: '\u{1F535}', question: '\u{1F4AC}', schedule: '\u{1F4C5}', overdue: '\u26A0\uFE0F' };
+const CL = { urgent: '\u{1F534} งานด่วน', normal: '\u{1F535} งานทั่วไป', question: '\u{1F4AC} คำถามจากทีม', schedule: '\u{1F4C5} ตารางงาน', overdue: '\u26A0\uFE0F งานค้าง' };
 
-// ─── Build Quick Reply buttons for pending tasks ───
-function buildQuickReply(action) {
-  const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
-  if (!pending.length) return undefined;
-  const items = pending.slice(0, 13).map(t => ({
-    type: 'action',
-    action: {
-      type: 'message',
-      label: (CE[t.category]||'') + ' ' + t.title.slice(0, 16),
-      text: action === 'done' ? 'เสร็จ ' + t.id.slice(-4) : action === 'reply' ? 'ตอบ ' + t.id.slice(-4) + ': ' : 'ดูงาน ' + t.id.slice(-4),
-    }
-  }));
-  return { items };
-}
-
-// ─── Build Flex Message: task list with buttons ───
+// ─── Build task list + Quick Reply for boss ───
 function buildTaskListFlex() {
   const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
-  if (!pending.length) {
-    return [{ type: 'text', text: '\u{1F389} ไม่มีงานค้าง! เก่งมากครับ' }];
-  }
+  if (!pending.length) return [{ type: 'text', text: '\u{1F389} ไม่มีงานค้าง! เก่งมากครับ' }];
 
   let text = '\u{1F4CB} งานค้าง ' + pending.length + ' รายการ\n━━━━━━━━━━━━━━\n';
-  pending.forEach((t, i) => {
-    text += (i + 1) + '. ' + (CE[t.category] || '') + ' ' + t.title + '\n';
-  });
+  pending.forEach((t, i) => { text += (i + 1) + '. ' + (CE[t.category] || '') + ' ' + t.title + '\n'; });
   text += '━━━━━━━━━━━━━━\n\u{1F447} กดปุ่มด้านล่างเพื่อเลือกงาน';
 
-  // Quick reply buttons
   const qr = { items: [] };
   pending.slice(0, 13).forEach(t => {
     const isQ = t.category === 'question';
     qr.items.push({
-      type: 'action',
-      action: {
-        type: 'message',
+      type: 'action', action: { type: 'message',
         label: (isQ ? '\u{1F4AC}ตอบ ' : '\u2705เสร็จ ') + t.title.slice(0, 14),
-        text: isQ ? 'ตอบ ' + t.id.slice(-4) + ': ' : 'เสร็จ ' + t.id.slice(-4),
+        text: isQ ? 'ตอบ ' + t.id.slice(-4) : 'เสร็จ ' + t.id.slice(-4),
       }
     });
   });
-
   return [{ type: 'text', text, quickReply: qr }];
 }
 
+// ─── Upload image to LINE content server and get URL ───
+// LINE requires image URL for image messages. We'll host images on the server.
+const uploadedImages = {};
+app.get('/img/:id', (req, res) => {
+  const data = uploadedImages[req.params.id];
+  if (!data) return res.status(404).send('Not found');
+  const match = data.match(/^data:image\/(\w+);base64,(.+)$/);
+  if (!match) return res.status(400).send('Invalid');
+  const buf = Buffer.from(match[2], 'base64');
+  res.set('Content-Type', 'image/' + match[1]);
+  res.send(buf);
+});
+
 // ========== WEB UI (ภาษาไทย) ==========
 app.get('/', (req, res) => {
+  const BASE = req.protocol + '://' + req.get('host');
   res.send(`<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Boss Task Manager — Shopgenix</title>
@@ -159,7 +153,7 @@ body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:li
 </div></div>
 
 <div class="wrap">
-  <div class="info" style="background:#F0FDF4;border:1px solid #BBF7D0;color:#065F46">\u2705 เจ้านายกดปุ่มเลือกงานใน LINE ได้เลย ไม่ต้องจำรหัส!</div>
+  <div class="info" style="background:#F0FDF4;border:1px solid #BBF7D0;color:#065F46">\u2705 เจ้านายกดปุ่มเลือกงาน → พิมพ์คำตอบ → ส่งแจ้งป๊อปปี้อัตโนมัติ</div>
   <div class="info" style="background:#EFF6FF;border:1px solid #BFDBFE;color:#1E40AF">\u{1F305} สรุปงานค้างส่งอัตโนมัติทุกวัน 08:30 น.</div>
   <div class="tabs" id="tabs"></div>
   <div id="task-list"></div>
@@ -180,7 +174,7 @@ body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:li
   </div>
   <div class="field hidden" id="from-field"><label>ถามโดย</label><input id="f-from" placeholder="เช่น ทีม Marketing"></div>
   <div class="field hidden" id="img-field">
-    <label>\u{1F4F7} แนบรูปภาพ (ส่งให้เจ้านายดูใน LINE)</label>
+    <label>\u{1F4F7} แนบรูปภาพ (ส่งรูปให้เจ้านายดูใน LINE เลย)</label>
     <div class="upload-area" onclick="document.getElementById('f-img').click()">
       <div style="font-size:24px;margin-bottom:4px">\u{1F4F7}</div>
       <div style="font-size:12px;color:#8B5CF6">กดเพื่อเลือกรูป หรือถ่ายรูป</div>
@@ -203,19 +197,11 @@ body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:li
     <button class="btn btn-purple" onclick="triggerDaily()">\u{1F305} ส่งสรุปงานค้างตอนนี้</button>
   </div>
   <div id="test-result"></div>
-  <div style="margin-top:14px;padding:12px;border-radius:12px;background:#EFF6FF;border:1px solid #BFDBFE">
-    <div style="font-size:12px;font-weight:700;color:#1E40AF;margin-bottom:4px">\u{1F4CC} วิธีที่เจ้านายตอบใน LINE:</div>
-    <div style="font-size:12px;color:#334155;line-height:1.6">
-      \u{1F449} <b>กดปุ่มเลือกงาน</b> ที่แสดงใต้ข้อความ<br>
-      \u{1F449} หรือพิมพ์ <b>"เสร็จ XXXX"</b> / <b>"ตอบ XXXX: คำตอบ"</b><br>
-      \u{1F449} พิมพ์อะไรก็ได้ = ดูรายการงานค้าง + ปุ่มกด
-    </div>
-  </div>
   <button class="btn" style="margin-top:12px;background:#fff;color:#64748B;border:1px solid #E2E8F0" onclick="hideTest()">ปิด</button>
 </div></div>
 
 <script>
-const CATS={urgent:{l:'งานด่วน',e:'\\u{1F534}',c:'#EF4444',bg:'#FEF2F2'},normal:{l:'งานทั่วไป',e:'\\u{1F535}',c:'#3B82F6',bg:'#EFF6FF'},question:{l:'คำถามจากทีม',e:'\\u{1F4AC}',c:'#8B5CF6',bg:'#F5F3FF'},schedule:{l:'ตารางงาน',e:'\\u{1F4C5}',c:'#F59E0B',bg:'#FFFBEB'}};
+const CATS={urgent:{l:'งานด่วน',e:'\\u{1F534}',c:'#EF4444',bg:'#FEF2F2'},normal:{l:'งานทั่วไป',e:'\\u{1F535}',c:'#3B82F6',bg:'#EFF6FF'},question:{l:'คำถามจากทีม',e:'\\u{1F4AC}',c:'#8B5CF6',bg:'#F5F3FF'},schedule:{l:'ตารางงาน',e:'\\u{1F4C5}',c:'#F59E0B',bg:'#FFFBEB'},overdue:{l:'งานค้าง',e:'\\u26A0\\uFE0F',c:'#DC2626',bg:'#FEF2F2'}};
 const STS={pending:{l:'รอดำเนินการ',c:'#F59E0B',bg:'#FFFBEB'},sent:{l:'ส่งไลน์แล้ว',c:'#3B82F6',bg:'#EFF6FF'},done:{l:'เสร็จแล้ว \\u2713',c:'#10B981',bg:'#ECFDF5'},replied:{l:'ตอบแล้ว',c:'#10B981',bg:'#ECFDF5'}};
 let tasks=[],curCat='urgent',curFilter='all',imgBase64=null;
 
@@ -262,29 +248,47 @@ loadTasks();
 // ========== API ==========
 app.post('/api/tasks', async (req, res) => {
   try {
-    const task = { id: genId(), ...req.body, status: 'sent', reply: null, createdAt: new Date().toISOString(), doneAt: null, imageUrl: null };
-    if (req.body.imageBase64) { task.imageUrl = req.body.imageBase64; delete task.imageBase64; }
+    const BASE = req.protocol + '://' + req.get('host');
+    const task = { id: genId(), ...req.body, status: 'sent', reply: null, createdAt: new Date().toISOString(), doneAt: null, imageUrl: null, imageId: null };
+
+    // Handle image
+    if (req.body.imageBase64) {
+      const imgId = 'img_' + task.id;
+      uploadedImages[imgId] = req.body.imageBase64;
+      task.imageUrl = BASE + '/img/' + imgId;
+      task.imageId = imgId;
+      delete task.imageBase64;
+    }
     tasks.push(task);
+
+    // Build LINE messages
+    const lineMessages = [];
+    const isQ = task.category === 'question';
 
     let msg = (CL[task.category]||'งาน')+'\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n';
     if (task.detail) msg += '\u{1F4DD} '+task.detail+'\n';
     if (task.dueDate) msg += '\u23F0 กำหนด: '+task.dueDate+' '+(task.dueTime||'')+'\n';
     if (task.from) msg += '\u{1F464} จาก: '+task.from+'\n';
     msg += '━━━━━━━━━━━━━━\n';
-    const isQ = task.category === 'question';
-    msg += isQ ? '\u{1F4AC} ตอบ: กดปุ่ม "ตอบ" ด้านล่าง' : '\u2705 เสร็จ: กดปุ่ม "เสร็จ" ด้านล่าง';
-    if (task.imageUrl) msg += '\n\u{1F4F7} (มีรูปแนบ — ดูในเว็บ)';
+    msg += isQ ? '\u{1F447} กดปุ่ม "ตอบคำถามนี้" ด้านล่าง' : '\u{1F447} กดปุ่ม "ทำเสร็จแล้ว" ด้านล่าง';
 
-    // Quick Reply button for this specific task
     const qr = { items: [{
-      type: 'action',
-      action: { type: 'message', label: isQ ? '\u{1F4AC} ตอบคำถามนี้' : '\u2705 ทำเสร็จแล้ว', text: isQ ? 'ตอบ ' + task.id.slice(-4) + ': ' : 'เสร็จ ' + task.id.slice(-4) }
+      type: 'action', action: { type: 'message',
+        label: isQ ? '\u{1F4AC} ตอบคำถามนี้' : '\u2705 ทำเสร็จแล้ว',
+        text: isQ ? 'ตอบ ' + task.id.slice(-4) : 'เสร็จ ' + task.id.slice(-4),
+      }
     }, {
-      type: 'action',
-      action: { type: 'message', label: '\u{1F4CB} ดูงานทั้งหมด', text: 'งาน' }
+      type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานทั้งหมด', text: 'งาน' }
     }] };
 
-    await pushLine(BOSS, [{ type: 'text', text: msg, quickReply: qr }]);
+    lineMessages.push({ type: 'text', text: msg, quickReply: qr });
+
+    // Send image to boss LINE if attached
+    if (task.imageUrl) {
+      lineMessages.splice(0, 0, { type: 'image', originalContentUrl: task.imageUrl, previewImageUrl: task.imageUrl });
+    }
+
+    await pushLine(BOSS, lineMessages);
     res.json({ success: true, task });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -322,42 +326,76 @@ app.post('/webhook', (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') return;
     const text = event.message.text.trim();
     const rt = event.replyToken;
+    const userId = event.source.userId;
 
-    // ─── เสร็จ ───
+    // ─── Check if boss is in reply mode (waiting for answer text) ───
+    if (bossReplyState[userId]) {
+      const code = bossReplyState[userId];
+      delete bossReplyState[userId];
+      const task = tasks.find(t => t.id.slice(-4) === code && t.category === 'question' && t.status !== 'replied');
+      if (task) {
+        task.status = 'replied'; task.reply = text; task.doneAt = new Date().toISOString();
+        const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
+        const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
+        await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} ส่งคำตอบเรียบร้อย!\n\u{1F4CC} '+task.title+'\n\u{1F4AC} "'+text+'"\n\u{1F4E9} แจ้งเลขาแล้ว', quickReply: qr }]);
+        await pushLine(SEC, '\u{1F4AC} เจ้านายตอบคำถามแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n\u{1F4AC} คำตอบ: '+text+'\n'+(task.from?'\u{1F464} ถามโดย: '+task.from+'\n':'')+'━━━━━━━━━━━━━━\n\u{1F4E9} ส่งต่อคำตอบให้ทีมได้เลย');
+      } else {
+        await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบคำถามนี้แล้ว อาจถูกตอบไปแล้ว' }]);
+      }
+      return;
+    }
+
+    // ─── "เสร็จ XXXX" ───
     if (text.startsWith('เสร็จ') || text.startsWith('done')) {
       const code = text.replace(/^(done|เสร็จ)\s*/i, '').trim();
       const task = tasks.find(t => t.id.slice(-4) === code && t.status !== 'done' && t.status !== 'replied');
       if (task) {
+        // If it's a question, enter reply mode instead
+        if (task.category === 'question') {
+          bossReplyState[userId] = code;
+          await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} คำถาม: "'+task.title+'"\n'+(task.from?'\u{1F464} จาก: '+task.from+'\n':'')+'\n\u{1F447} พิมพ์คำตอบแล้วกดส่งเลยครับ' }]);
+          return;
+        }
         task.status = 'done'; task.doneAt = new Date().toISOString();
         const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
-        // ตอบเจ้านาย + ปุ่มดูงานที่เหลือ
         const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
         await replyLine(rt, [{ type: 'text', text: '\u2705 เรียบร้อย! "'+task.title+'" เสร็จแล้ว\n\u{1F4CB} งานค้างเหลือ: '+remaining+' รายการ', quickReply: qr }]);
-        // แจ้งเลขา
         await pushLine(SEC, '\u2705 เจ้านายทำงานเสร็จแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n'+(task.detail?'\u{1F4DD} '+task.detail+'\n':'')+'\u23F0 เสร็จเมื่อ: '+fmtDate()+'\n━━━━━━━━━━━━━━\n\u{1F4CB} งานค้างคงเหลือ: '+remaining+' รายการ');
       } else { await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบงานรหัส "'+code+'"' }]); }
       return;
     }
 
-    // ─── ตอบ ───
+    // ─── "ตอบ XXXX" (with or without colon/answer) ───
     if (text.startsWith('ตอบ') || text.startsWith('reply')) {
       const rest = text.replace(/^(reply|ตอบ)\s*/i, '').trim();
       const ci = rest.indexOf(':');
-      if (ci === -1) { await replyLine(rt, [{ type: 'text', text: '\u2753 รูปแบบ: ตอบ XXXX: คำตอบ\nเช่น: ตอบ A1B2: อนุมัติครับ' }]); return; }
-      const code = rest.slice(0, ci).trim();
-      const reply = rest.slice(ci + 1).trim();
-      const task = tasks.find(t => t.id.slice(-4) === code && t.category === 'question');
-      if (task && reply) {
-        task.status = 'replied'; task.reply = reply; task.doneAt = new Date().toISOString();
-        const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
-        const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
-        await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} ส่งคำตอบเรียบร้อย!\n\u{1F4CC} '+task.title+'\n\u{1F4AC} "'+reply+'"\n\u{1F4E9} แจ้งเลขาแล้ว', quickReply: qr }]);
-        await pushLine(SEC, '\u{1F4AC} เจ้านายตอบคำถามแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n\u{1F4AC} คำตอบ: '+reply+'\n'+(task.from?'\u{1F464} ถามโดย: '+task.from+'\n':'')+'━━━━━━━━━━━━━━\n\u{1F4E9} ส่งต่อคำตอบให้ทีมได้เลย');
+
+      // If has colon with answer after it: direct reply
+      if (ci !== -1 && rest.slice(ci + 1).trim()) {
+        const code = rest.slice(0, ci).trim();
+        const reply = rest.slice(ci + 1).trim();
+        const task = tasks.find(t => t.id.slice(-4) === code && t.category === 'question');
+        if (task && reply) {
+          task.status = 'replied'; task.reply = reply; task.doneAt = new Date().toISOString();
+          const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
+          const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
+          await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} ส่งคำตอบเรียบร้อย!\n\u{1F4CC} '+task.title+'\n\u{1F4AC} "'+reply+'"\n\u{1F4E9} แจ้งเลขาแล้ว', quickReply: qr }]);
+          await pushLine(SEC, '\u{1F4AC} เจ้านายตอบคำถามแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n\u{1F4AC} คำตอบ: '+reply+'\n'+(task.from?'\u{1F464} ถามโดย: '+task.from+'\n':'')+'━━━━━━━━━━━━━━\n\u{1F4E9} ส่งต่อคำตอบให้ทีมได้เลย');
+        } else { await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบคำถามรหัส "'+code+'"' }]); }
+        return;
+      }
+
+      // If just "ตอบ XXXX" without answer: enter reply mode
+      const code = rest.replace(':', '').trim();
+      const task = tasks.find(t => t.id.slice(-4) === code && t.category === 'question' && t.status !== 'replied');
+      if (task) {
+        bossReplyState[userId] = code;
+        await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} คำถาม: "'+task.title+'"\n'+(task.from?'\u{1F464} จาก: '+task.from+'\n':'')+(task.detail?'\u{1F4DD} '+task.detail+'\n':'')+'\n\u{1F447} พิมพ์คำตอบแล้วกดส่งเลยครับ' }]);
       } else { await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบคำถามรหัส "'+code+'"' }]); }
       return;
     }
 
-    // ─── ดูงาน / ข้อความอื่นๆ → แสดงรายการ + ปุ่มกด ───
+    // ─── Default: show task list with buttons ───
     await replyLine(rt, buildTaskListFlex());
   });
   res.json({ ok: true });
@@ -370,14 +408,11 @@ async function sendDailySummary() {
   let msg = '\u{1F305} สรุปงานประจำวัน (08:30)\n━━━━━━━━━━━━━━\n\u{1F4CB} งานค้าง '+pending.length+' รายการ\n\n';
   pending.forEach((t, i) => { msg += (i+1)+'. '+(CE[t.category]||'')+' '+t.title+'\n'; });
   msg += '\n━━━━━━━━━━━━━━\n\u{1F447} กดปุ่มด้านล่างเพื่อเลือกงาน';
-
-  // Quick Reply สำหรับสรุปประจำวัน
   const qr = { items: [] };
   pending.slice(0, 13).forEach(t => {
     const isQ = t.category === 'question';
-    qr.items.push({ type: 'action', action: { type: 'message', label: (isQ?'\u{1F4AC}ตอบ ':'\u2705เสร็จ ')+t.title.slice(0,14), text: isQ?'ตอบ '+t.id.slice(-4)+': ':'เสร็จ '+t.id.slice(-4) } });
+    qr.items.push({ type: 'action', action: { type: 'message', label: (isQ?'\u{1F4AC}ตอบ ':'\u2705เสร็จ ')+t.title.slice(0,14), text: isQ?'ตอบ '+t.id.slice(-4):'เสร็จ '+t.id.slice(-4) } });
   });
-
   await pushLine(BOSS, [{ type: 'text', text: msg, quickReply: qr }]);
   await pushLine(SEC, '\u{1F4E9} สำเนาสรุปงาน (ส่งเจ้านายแล้ว)\n\n'+msg);
 }
