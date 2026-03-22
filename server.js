@@ -11,37 +11,80 @@ const PORT = process.env.PORT || 3000;
 let tasks = [];
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-async function pushLine(to, text) {
+// ─── LINE Helpers ───
+async function pushLine(to, messages) {
+  if (typeof messages === 'string') messages = [{ type: 'text', text: messages }];
   const res = await fetch('https://api.line.me/v2/bot/message/push', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
-    body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+    body: JSON.stringify({ to, messages }),
   });
   if (!res.ok) console.error('LINE error:', await res.text());
   return res.ok;
 }
-
-async function replyLine(replyToken, text) {
+async function replyLine(rt, messages) {
+  if (typeof messages === 'string') messages = [{ type: 'text', text: messages }];
   await fetch('https://api.line.me/v2/bot/message/reply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
-    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+    body: JSON.stringify({ replyToken: rt, messages }),
   });
 }
-
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 function fmtDate() { return new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' }); }
+const CE = { urgent: '\u{1F534}', normal: '\u{1F535}', question: '\u{1F4AC}', schedule: '\u{1F4C5}' };
+const CL = { urgent: '\u{1F534} งานด่วน', normal: '\u{1F535} งานทั่วไป', question: '\u{1F4AC} คำถามจากทีม', schedule: '\u{1F4C5} ตารางงาน' };
 
-// ========== WEB UI ==========
+// ─── Build Quick Reply buttons for pending tasks ───
+function buildQuickReply(action) {
+  const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
+  if (!pending.length) return undefined;
+  const items = pending.slice(0, 13).map(t => ({
+    type: 'action',
+    action: {
+      type: 'message',
+      label: (CE[t.category]||'') + ' ' + t.title.slice(0, 16),
+      text: action === 'done' ? 'เสร็จ ' + t.id.slice(-4) : action === 'reply' ? 'ตอบ ' + t.id.slice(-4) + ': ' : 'ดูงาน ' + t.id.slice(-4),
+    }
+  }));
+  return { items };
+}
+
+// ─── Build Flex Message: task list with buttons ───
+function buildTaskListFlex() {
+  const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
+  if (!pending.length) {
+    return [{ type: 'text', text: '\u{1F389} ไม่มีงานค้าง! เก่งมากครับ' }];
+  }
+
+  let text = '\u{1F4CB} งานค้าง ' + pending.length + ' รายการ\n━━━━━━━━━━━━━━\n';
+  pending.forEach((t, i) => {
+    text += (i + 1) + '. ' + (CE[t.category] || '') + ' ' + t.title + '\n';
+  });
+  text += '━━━━━━━━━━━━━━\n\u{1F447} กดปุ่มด้านล่างเพื่อเลือกงาน';
+
+  // Quick reply buttons
+  const qr = { items: [] };
+  pending.slice(0, 13).forEach(t => {
+    const isQ = t.category === 'question';
+    qr.items.push({
+      type: 'action',
+      action: {
+        type: 'message',
+        label: (isQ ? '\u{1F4AC}ตอบ ' : '\u2705เสร็จ ') + t.title.slice(0, 14),
+        text: isQ ? 'ตอบ ' + t.id.slice(-4) + ': ' : 'เสร็จ ' + t.id.slice(-4),
+      }
+    });
+  });
+
+  return [{ type: 'text', text, quickReply: qr }];
+}
+
+// ========== WEB UI (ภาษาไทย) ==========
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
-<html lang="th">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Boss Task Manager</title>
+<html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Boss Task Manager — Shopgenix</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:linear-gradient(160deg,#F8FAFC,#EEF2FF,#F0FDF4);min-height:100vh}
@@ -66,6 +109,7 @@ body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:li
 .detail{font-size:12px;color:#64748B;line-height:1.5;margin-top:3px}
 .meta{display:flex;gap:12px;margin-top:6px;flex-wrap:wrap;font-size:11px;color:#94A3B8}
 .reply-box{margin-top:8px;padding:8px 12px;border-radius:8px;background:#ECFDF5;border:1px solid #A7F3D0;font-size:12px;color:#065F46}
+.img-preview{margin-top:8px;border-radius:8px;max-width:100%;max-height:200px;object-fit:cover}
 .btn{padding:10px 18px;border-radius:12px;border:none;font-size:14px;font-weight:700;cursor:pointer;width:100%}
 .btn-green{background:#06C755;color:#fff}
 .btn-blue{background:#3B82F6;color:#fff}
@@ -78,218 +122,169 @@ body{font-family:'Noto Sans Thai',Sarabun,-apple-system,sans-serif;background:li
 .modal h3{font-size:17px;font-weight:800;color:#1E293B;margin-bottom:16px}
 .field label{font-size:12px;font-weight:600;color:#64748B;display:block;margin-bottom:4px}
 .field{margin-bottom:10px}
-.field input,.field textarea,.field select{width:100%;padding:10px 14px;border-radius:10px;border:1.5px solid #E2E8F0;font-size:14px;color:#1E293B;outline:none;background:#FAFBFC;font-family:inherit}
+.field input,.field textarea{width:100%;padding:10px 14px;border-radius:10px;border:1.5px solid #E2E8F0;font-size:14px;color:#1E293B;outline:none;background:#FAFBFC;font-family:inherit}
 .field textarea{resize:vertical}
 .cat-btns{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px}
 .cat-btn{padding:6px 12px;border-radius:8px;border:2px solid #E2E8F0;background:#fff;font-size:12px;font-weight:600;cursor:pointer}
 .cat-btn.active{border-color:var(--cc);background:var(--bg)}
 .row{display:flex;gap:8px}
 .result{margin-top:12px;padding:12px 16px;border-radius:12px;font-size:14px;font-weight:700}
-.tabs{display:flex;gap:4px;overflow-x:auto;margin-bottom:12px;-ms-overflow-style:none;scrollbar-width:none}
+.tabs{display:flex;gap:4px;overflow-x:auto;margin-bottom:12px;scrollbar-width:none}
 .tab{padding:7px 12px;border-radius:10px;border:none;font-size:12px;font-weight:500;cursor:pointer;white-space:nowrap;background:transparent;color:#64748B}
 .tab.active{font-weight:700}
 .top-btns{display:flex;gap:5px}
 .top-btn{padding:6px 10px;border-radius:10px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.1);color:#fff}
 .hidden{display:none}
-</style>
-</head>
-<body>
-<div class="hdr">
-<div style="max-width:560px;margin:0 auto">
+.upload-area{border:2px dashed #DDD6FE;border-radius:12px;padding:16px;text-align:center;cursor:pointer;background:#F5F3FF}
+.upload-area:hover{border-color:#8B5CF6;background:#EDE9FE}
+.upload-preview{position:relative;display:inline-block;margin-top:8px}
+.upload-preview img{max-height:150px;border-radius:8px}
+.upload-remove{position:absolute;top:-6px;right:-6px;width:22px;height:22px;border-radius:11px;background:#EF4444;color:#fff;border:none;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+</style></head><body>
+<div class="hdr"><div style="max-width:560px;margin:0 auto">
   <div style="display:flex;justify-content:space-between;align-items:center">
-    <div><h1>Boss Task Manager</h1><p>by poppy — Shopgenix</p></div>
+    <div><h1>Boss Task Manager</h1><p>by ป๊อปปี้ — Shopgenix</p></div>
     <div class="top-btns">
-      <button class="top-btn" onclick="showTest()">test</button>
-      <button class="top-btn" onclick="loadTasks()">refresh</button>
+      <button class="top-btn" onclick="showTest()">ทดสอบ</button>
+      <button class="top-btn" onclick="loadTasks()">รีเฟรช</button>
     </div>
   </div>
-  <div class="live"><div class="live-dot"></div><span>LINE connected</span></div>
+  <div class="live"><div class="live-dot"></div><span>LINE เชื่อมต่อแล้ว</span></div>
   <div class="stats">
-    <div class="stat"><b id="s-pending" style="color:#F59E0B">0</b><small>pending</small></div>
-    <div class="stat"><b id="s-urgent" style="color:#EF4444">0</b><small>urgent</small></div>
-    <div class="stat"><b id="s-question" style="color:#8B5CF6">0</b><small>questions</small></div>
-    <div class="stat"><b id="s-done" style="color:#10B981">0</b><small>done</small></div>
+    <div class="stat"><b id="s-pending" style="color:#F59E0B">0</b><small>งานค้าง</small></div>
+    <div class="stat"><b id="s-urgent" style="color:#EF4444">0</b><small>ด่วน</small></div>
+    <div class="stat"><b id="s-question" style="color:#8B5CF6">0</b><small>รอตอบ</small></div>
+    <div class="stat"><b id="s-done" style="color:#10B981">0</b><small>เสร็จ</small></div>
   </div>
-</div>
-</div>
+</div></div>
 
 <div class="wrap">
-  <div class="info" style="background:#F0FDF4;border:1px solid #BBF7D0;color:#065F46">boss replies in LINE will notify poppy automatically</div>
-  <div class="info" style="background:#EFF6FF;border:1px solid #BFDBFE;color:#1E40AF">daily summary at 08:30</div>
+  <div class="info" style="background:#F0FDF4;border:1px solid #BBF7D0;color:#065F46">\u2705 เจ้านายกดปุ่มเลือกงานใน LINE ได้เลย ไม่ต้องจำรหัส!</div>
+  <div class="info" style="background:#EFF6FF;border:1px solid #BFDBFE;color:#1E40AF">\u{1F305} สรุปงานค้างส่งอัตโนมัติทุกวัน 08:30 น.</div>
   <div class="tabs" id="tabs"></div>
   <div id="task-list"></div>
 </div>
 
 <button class="fab" onclick="showAdd()">+</button>
 
-<!-- Add Task Modal -->
 <div class="modal-bg hidden" id="add-modal" onclick="hideAdd()">
 <div class="modal" onclick="event.stopPropagation()">
-  <h3>add new task + send LINE to boss</h3>
-  <div style="padding:8px 12px;border-radius:8px;background:#F0FDF4;border:1px solid #BBF7D0;margin-bottom:14px;font-size:12px;color:#065F46;font-weight:600">press add = send LINE to boss immediately!</div>
+  <h3>\u2795 เพิ่มงานใหม่ + ส่ง LINE เจ้านาย</h3>
+  <div style="padding:8px 12px;border-radius:8px;background:#F0FDF4;border:1px solid #BBF7D0;margin-bottom:14px;font-size:12px;color:#065F46;font-weight:600">\u{1F4E4} กดเพิ่มงาน = ส่ง LINE ถึงเจ้านายทันที!</div>
   <div class="cat-btns" id="cat-btns"></div>
-  <div class="field"><label id="title-label">title *</label><input id="f-title" placeholder="e.g. Board Meeting"></div>
-  <div class="field"><label>detail</label><textarea id="f-detail" rows="2"></textarea></div>
+  <div class="field"><label id="title-label">หัวข้องาน *</label><input id="f-title" placeholder="เช่น ประชุม Board Meeting"></div>
+  <div class="field"><label>รายละเอียด</label><textarea id="f-detail" rows="2" placeholder="รายละเอียดเพิ่มเติม..."></textarea></div>
   <div class="row">
-    <div class="field" style="flex:1"><label>due date</label><input type="date" id="f-date"></div>
-    <div class="field" style="flex:1"><label>time</label><input type="time" id="f-time"></div>
+    <div class="field" style="flex:1"><label>วันกำหนด</label><input type="date" id="f-date"></div>
+    <div class="field" style="flex:1"><label>เวลา</label><input type="time" id="f-time"></div>
   </div>
-  <div class="field hidden" id="from-field"><label>asked by</label><input id="f-from" placeholder="e.g. Marketing team"></div>
+  <div class="field hidden" id="from-field"><label>ถามโดย</label><input id="f-from" placeholder="เช่น ทีม Marketing"></div>
+  <div class="field hidden" id="img-field">
+    <label>\u{1F4F7} แนบรูปภาพ (ส่งให้เจ้านายดูใน LINE)</label>
+    <div class="upload-area" onclick="document.getElementById('f-img').click()">
+      <div style="font-size:24px;margin-bottom:4px">\u{1F4F7}</div>
+      <div style="font-size:12px;color:#8B5CF6">กดเพื่อเลือกรูป หรือถ่ายรูป</div>
+    </div>
+    <input type="file" id="f-img" accept="image/*" style="display:none" onchange="previewImg(this)">
+    <div id="img-preview-wrap"></div>
+  </div>
   <div class="row" style="gap:8px;margin-top:6px">
-    <button class="btn" style="flex:1;background:#fff;color:#64748B;border:1px solid #E2E8F0" onclick="hideAdd()">cancel</button>
-    <button class="btn btn-green" style="flex:2" id="add-btn" onclick="addTask()">add + send LINE</button>
+    <button class="btn" style="flex:1;background:#fff;color:#64748B;border:1px solid #E2E8F0" onclick="hideAdd()">ยกเลิก</button>
+    <button class="btn btn-green" style="flex:2" id="add-btn" onclick="addTask()">\u{1F4E4} เพิ่มงาน + ส่ง LINE</button>
   </div>
-</div>
-</div>
+</div></div>
 
-<!-- Test Modal -->
 <div class="modal-bg hidden" id="test-modal" onclick="hideTest()">
 <div class="modal" onclick="event.stopPropagation()">
-  <h3>test LINE connection</h3>
+  <h3>\u{1F9EA} ทดสอบส่ง LINE จริง</h3>
   <div style="display:flex;flex-direction:column;gap:10px">
-    <button class="btn btn-amber" onclick="testLine('boss')">send test to boss</button>
-    <button class="btn btn-blue" onclick="testLine('secretary')">send test to poppy</button>
-    <button class="btn btn-purple" onclick="triggerDaily()">send daily summary now</button>
+    <button class="btn btn-amber" onclick="testLine('boss')">\u{1F454} ส่งทดสอบถึงเจ้านาย</button>
+    <button class="btn btn-blue" onclick="testLine('secretary')">\u{1F4BC} ส่งทดสอบถึงป๊อปปี้</button>
+    <button class="btn btn-purple" onclick="triggerDaily()">\u{1F305} ส่งสรุปงานค้างตอนนี้</button>
   </div>
   <div id="test-result"></div>
   <div style="margin-top:14px;padding:12px;border-radius:12px;background:#EFF6FF;border:1px solid #BFDBFE">
-    <div style="font-size:12px;font-weight:700;color:#1E40AF;margin-bottom:4px">how boss replies in LINE:</div>
+    <div style="font-size:12px;font-weight:700;color:#1E40AF;margin-bottom:4px">\u{1F4CC} วิธีที่เจ้านายตอบใน LINE:</div>
     <div style="font-size:12px;color:#334155;line-height:1.6">
-      type <b>"done XXXX"</b> to mark done<br>
-      type <b>"reply XXXX: answer"</b> to answer<br>
-      type anything else to see pending tasks
+      \u{1F449} <b>กดปุ่มเลือกงาน</b> ที่แสดงใต้ข้อความ<br>
+      \u{1F449} หรือพิมพ์ <b>"เสร็จ XXXX"</b> / <b>"ตอบ XXXX: คำตอบ"</b><br>
+      \u{1F449} พิมพ์อะไรก็ได้ = ดูรายการงานค้าง + ปุ่มกด
     </div>
   </div>
-  <button class="btn" style="margin-top:12px;background:#fff;color:#64748B;border:1px solid #E2E8F0" onclick="hideTest()">close</button>
-</div>
-</div>
+  <button class="btn" style="margin-top:12px;background:#fff;color:#64748B;border:1px solid #E2E8F0" onclick="hideTest()">ปิด</button>
+</div></div>
 
 <script>
-const CATS={urgent:{l:'urgent',e:'\\u{1F534}',c:'#EF4444',bg:'#FEF2F2'},normal:{l:'normal',e:'\\u{1F535}',c:'#3B82F6',bg:'#EFF6FF'},question:{l:'question',e:'\\u{1F4AC}',c:'#8B5CF6',bg:'#F5F3FF'},schedule:{l:'schedule',e:'\\u{1F4C5}',c:'#F59E0B',bg:'#FFFBEB'}};
-const STS={pending:{l:'pending',c:'#F59E0B',bg:'#FFFBEB'},sent:{l:'sent to LINE',c:'#3B82F6',bg:'#EFF6FF'},done:{l:'done',c:'#10B981',bg:'#ECFDF5'},replied:{l:'replied',c:'#10B981',bg:'#ECFDF5'}};
-let tasks=[], curCat='urgent', curFilter='all';
+const CATS={urgent:{l:'งานด่วน',e:'\\u{1F534}',c:'#EF4444',bg:'#FEF2F2'},normal:{l:'งานทั่วไป',e:'\\u{1F535}',c:'#3B82F6',bg:'#EFF6FF'},question:{l:'คำถามจากทีม',e:'\\u{1F4AC}',c:'#8B5CF6',bg:'#F5F3FF'},schedule:{l:'ตารางงาน',e:'\\u{1F4C5}',c:'#F59E0B',bg:'#FFFBEB'}};
+const STS={pending:{l:'รอดำเนินการ',c:'#F59E0B',bg:'#FFFBEB'},sent:{l:'ส่งไลน์แล้ว',c:'#3B82F6',bg:'#EFF6FF'},done:{l:'เสร็จแล้ว \\u2713',c:'#10B981',bg:'#ECFDF5'},replied:{l:'ตอบแล้ว',c:'#10B981',bg:'#ECFDF5'}};
+let tasks=[],curCat='urgent',curFilter='all',imgBase64=null;
 
-function loadTasks(){
-  fetch('/api/tasks').then(r=>r.json()).then(d=>{tasks=d||[];render();}).catch(()=>{});
-}
-
+function loadTasks(){fetch('/api/tasks').then(r=>r.json()).then(d=>{tasks=d||[];render();}).catch(()=>{});}
 function render(){
   const f=curFilter==='all'?tasks:tasks.filter(t=>t.category===curFilter);
   const counts={};Object.keys(CATS).forEach(k=>{counts[k]=tasks.filter(t=>t.category===k&&t.status!=='done'&&t.status!=='replied').length;});
-  const pending=tasks.filter(t=>t.status!=='done'&&t.status!=='replied').length;
-  const done=tasks.filter(t=>t.status==='done'||t.status==='replied').length;
-  document.getElementById('s-pending').textContent=pending;
+  document.getElementById('s-pending').textContent=tasks.filter(t=>t.status!=='done'&&t.status!=='replied').length;
   document.getElementById('s-urgent').textContent=counts.urgent||0;
   document.getElementById('s-question').textContent=counts.question||0;
-  document.getElementById('s-done').textContent=done;
-
-  let tabs='<button class="tab '+(curFilter==='all'?'active':'')+'" style="'+(curFilter==='all'?'background:#1E293B;color:#fff':'')+'" onclick="setFilter(\\'all\\')">all ('+tasks.length+')</button>';
-  Object.entries(CATS).forEach(([k,v])=>{
-    const active=curFilter===k;
-    tabs+='<button class="tab '+(active?'active':'')+'" style="'+(active?'background:'+v.c+';color:#fff':'')+'" onclick="setFilter(\\''+k+'\\')">'+v.e+' '+v.l+(counts[k]>0?' ('+counts[k]+')':'')+'</button>';
-  });
+  document.getElementById('s-done').textContent=tasks.filter(t=>t.status==='done'||t.status==='replied').length;
+  let tabs='<button class="tab '+(curFilter==='all'?'active':'')+'" style="'+(curFilter==='all'?'background:#1E293B;color:#fff':'')+'" onclick="setFilter(\\'all\\')">ทั้งหมด ('+tasks.length+')</button>';
+  Object.entries(CATS).forEach(([k,v])=>{const a=curFilter===k;tabs+='<button class="tab '+(a?'active':'')+'" style="'+(a?'background:'+v.c+';color:#fff':'')+'" onclick="setFilter(\\''+k+'\\')">'+v.e+' '+v.l+(counts[k]>0?' ('+counts[k]+')':'')+'</button>';});
   document.getElementById('tabs').innerHTML=tabs;
-
-  if(f.length===0){
-    document.getElementById('task-list').innerHTML='<div class="card" style="text-align:center;padding:30px;color:#94A3B8"><div style="font-size:32px">\\u{1F389}</div><div style="font-size:13px;font-weight:600;margin-top:4px">no tasks — press + to add</div></div>';
-    return;
-  }
+  if(!f.length){document.getElementById('task-list').innerHTML='<div class="card" style="text-align:center;padding:30px;color:#94A3B8"><div style="font-size:32px">\\u{1F389}</div><div style="font-size:13px;font-weight:600;margin-top:4px">ยังไม่มีงาน — กด + เพื่อเพิ่มงานแรก</div></div>';return;}
   const sorted=[...f].sort((a,b)=>({pending:0,sent:1,done:3,replied:3}[a.status]||0)-({pending:0,sent:1,done:3,replied:3}[b.status]||0));
-  let html='';
-  sorted.forEach(t=>{
-    const cat=CATS[t.category]||CATS.normal;
-    const st=STS[t.status]||STS.pending;
-    const isDone=t.status==='done'||t.status==='replied';
-    html+='<div class="card'+(isDone?' done':'')+'" style="border-left:4px solid '+cat.c+'">';
-    html+='<div class="card-head"><span style="font-size:15px">'+cat.e+'</span><span class="title">'+t.title+'</span><span class="badge" style="color:'+st.c+';background:'+st.bg+'">'+st.l+'</span></div>';
-    if(t.detail)html+='<div class="detail">'+t.detail+'</div>';
-    html+='<div class="meta">';
-    if(t.dueDate)html+='<span>\\u23F0 '+t.dueDate+(t.dueTime?' '+t.dueTime:'')+'</span>';
-    if(t.from)html+='<span>\\u{1F464} '+t.from+'</span>';
-    html+='<span style="color:#CBD5E1">ID:'+t.id.slice(-4)+'</span></div>';
-    if(t.reply)html+='<div class="reply-box">\\u{1F4AC} answer: '+t.reply+'</div>';
-    if(t.doneAt&&isDone)html+='<div style="font-size:10px;color:#94A3B8;margin-top:4px">done: '+new Date(t.doneAt).toLocaleString("th-TH")+'</div>';
-    html+='</div>';
-  });
-  document.getElementById('task-list').innerHTML=html;
+  let h='';sorted.forEach(t=>{const cat=CATS[t.category]||CATS.normal;const st=STS[t.status]||STS.pending;const isDone=t.status==='done'||t.status==='replied';
+    h+='<div class="card'+(isDone?' done':'')+'" style="border-left:4px solid '+cat.c+'">';
+    h+='<div class="card-head"><span style="font-size:15px">'+cat.e+'</span><span class="title">'+t.title+'</span><span class="badge" style="color:'+st.c+';background:'+st.bg+'">'+st.l+'</span></div>';
+    if(t.detail)h+='<div class="detail">'+t.detail+'</div>';
+    h+='<div class="meta">';if(t.dueDate)h+='<span>\\u23F0 '+t.dueDate+(t.dueTime?' '+t.dueTime:'')+'</span>';if(t.from)h+='<span>\\u{1F464} '+t.from+'</span>';h+='<span style="color:#CBD5E1">ID:'+t.id.slice(-4)+'</span></div>';
+    if(t.imageUrl)h+='<img class="img-preview" src="'+t.imageUrl+'" alt="รูปแนบ">';
+    if(t.reply)h+='<div class="reply-box">\\u{1F4AC} คำตอบ: '+t.reply+'</div>';
+    if(t.doneAt&&isDone)h+='<div style="font-size:10px;color:#94A3B8;margin-top:4px">เสร็จเมื่อ: '+new Date(t.doneAt).toLocaleString("th-TH")+'</div>';
+    h+='</div>';});
+  document.getElementById('task-list').innerHTML=h;
 }
-
 function setFilter(f){curFilter=f;render();}
-
-// Add task
-function showAdd(){document.getElementById('add-modal').classList.remove('hidden');renderCats();}
+function showAdd(){document.getElementById('add-modal').classList.remove('hidden');renderCats();imgBase64=null;document.getElementById('img-preview-wrap').innerHTML='';}
 function hideAdd(){document.getElementById('add-modal').classList.add('hidden');}
-function renderCats(){
-  let h='';
-  Object.entries(CATS).forEach(([k,v])=>{
-    h+='<button class="cat-btn'+(curCat===k?' active':'')+'" style="--cc:'+v.c+';--bg:'+v.bg+';'+(curCat===k?'border-color:'+v.c+';background:'+v.bg+';color:'+v.c:'')+'" onclick="setCat(\\''+k+'\\')">'+v.e+' '+v.l+'</button>';
-  });
-  document.getElementById('cat-btns').innerHTML=h;
-  document.getElementById('title-label').textContent=curCat==='question'?'question *':'title *';
-  document.getElementById('from-field').classList.toggle('hidden',curCat!=='question');
-}
+function renderCats(){let h='';Object.entries(CATS).forEach(([k,v])=>{h+='<button class="cat-btn'+(curCat===k?' active':'')+'" style="--cc:'+v.c+';--bg:'+v.bg+';'+(curCat===k?'border-color:'+v.c+';background:'+v.bg+';color:'+v.c:'')+'" onclick="setCat(\\''+k+'\\')">'+v.e+' '+v.l+'</button>';});document.getElementById('cat-btns').innerHTML=h;document.getElementById('title-label').textContent=curCat==='question'?'คำถาม *':'หัวข้องาน *';document.getElementById('from-field').classList.toggle('hidden',curCat!=='question');document.getElementById('img-field').classList.toggle('hidden',curCat!=='question');document.getElementById('f-title').placeholder=curCat==='question'?'เช่น อนุมัติ Budget Q2 ไหมครับ?':'เช่น ประชุม Board Meeting';}
 function setCat(c){curCat=c;renderCats();}
-
-async function addTask(){
-  const title=document.getElementById('f-title').value.trim();
-  if(!title)return;
-  const btn=document.getElementById('add-btn');
-  btn.disabled=true;btn.textContent='sending LINE...';
-  try{
-    const res=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      category:curCat,title,detail:document.getElementById('f-detail').value.trim(),
-      dueDate:document.getElementById('f-date').value||null,
-      dueTime:document.getElementById('f-time').value||null,
-      from:document.getElementById('f-from').value.trim()||null
-    })});
-    const data=await res.json();
-    if(data.success){tasks.unshift(data.task);render();hideAdd();
-      document.getElementById('f-title').value='';document.getElementById('f-detail').value='';
-      document.getElementById('f-date').value='';document.getElementById('f-time').value='';document.getElementById('f-from').value='';
-    }else{alert('error: '+(data.error||'unknown'));}
-  }catch(e){alert('error: '+e.message);}
-  btn.disabled=false;btn.textContent='add + send LINE';
-}
-
-// Test
+function previewImg(input){const file=input.files[0];if(!file)return;const reader=new FileReader();reader.onload=function(e){imgBase64=e.target.result;document.getElementById('img-preview-wrap').innerHTML='<div class="upload-preview"><img src="'+imgBase64+'"><button class="upload-remove" onclick="removeImg()">\\u2715</button></div>';};reader.readAsDataURL(file);}
+function removeImg(){imgBase64=null;document.getElementById('img-preview-wrap').innerHTML='';document.getElementById('f-img').value='';}
+async function addTask(){const title=document.getElementById('f-title').value.trim();if(!title)return;const btn=document.getElementById('add-btn');btn.disabled=true;btn.textContent='กำลังส่ง LINE...';try{const body={category:curCat,title,detail:document.getElementById('f-detail').value.trim(),dueDate:document.getElementById('f-date').value||null,dueTime:document.getElementById('f-time').value||null,from:document.getElementById('f-from').value.trim()||null,imageBase64:imgBase64||null};const res=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await res.json();if(data.success){tasks.unshift(data.task);render();hideAdd();document.getElementById('f-title').value='';document.getElementById('f-detail').value='';document.getElementById('f-date').value='';document.getElementById('f-time').value='';document.getElementById('f-from').value='';removeImg();}else{alert('ส่งไม่สำเร็จ: '+(data.error||''));}}catch(e){alert('ผิดพลาด: '+e.message);}btn.disabled=false;btn.textContent='\\u{1F4E4} เพิ่มงาน + ส่ง LINE';}
 function showTest(){document.getElementById('test-modal').classList.remove('hidden');}
 function hideTest(){document.getElementById('test-modal').classList.add('hidden');}
-async function testLine(target){
-  document.getElementById('test-result').innerHTML='<div class="result" style="background:#EFF6FF;color:#1E40AF">sending...</div>';
-  try{
-    const res=await fetch('/api/test-line',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target})});
-    const d=await res.json();
-    document.getElementById('test-result').innerHTML='<div class="result" style="background:'+(d.success?'#F0FDF4;color:#065F46':'#FEF2F2;color:#991B1B')+'">'+(d.success?'\\u{1F389} ':'\\u274C ')+(d.message||d.error)+'</div>';
-  }catch(e){document.getElementById('test-result').innerHTML='<div class="result" style="background:#FEF2F2;color:#991B1B">\\u274C '+e.message+'</div>';}
-}
-async function triggerDaily(){
-  document.getElementById('test-result').innerHTML='<div class="result" style="background:#EFF6FF;color:#1E40AF">sending summary...</div>';
-  try{
-    const res=await fetch('/api/daily-summary',{method:'POST'});
-    const d=await res.json();
-    document.getElementById('test-result').innerHTML='<div class="result" style="background:#F0FDF4;color:#065F46">\\u{1F389} sent!</div>';
-  }catch(e){document.getElementById('test-result').innerHTML='<div class="result" style="background:#FEF2F2;color:#991B1B">\\u274C '+e.message+'</div>';}
-}
-
+async function testLine(target){document.getElementById('test-result').innerHTML='<div class="result" style="background:#EFF6FF;color:#1E40AF">กำลังส่ง...</div>';try{const res=await fetch('/api/test-line',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target})});const d=await res.json();document.getElementById('test-result').innerHTML='<div class="result" style="background:'+(d.success?'#F0FDF4;color:#065F46':'#FEF2F2;color:#991B1B')+'">'+(d.success?'\\u{1F389} ':'\\u274C ')+(d.message||d.error)+'</div>';}catch(e){document.getElementById('test-result').innerHTML='<div class="result" style="background:#FEF2F2;color:#991B1B">\\u274C '+e.message+'</div>';}}
+async function triggerDaily(){document.getElementById('test-result').innerHTML='<div class="result" style="background:#EFF6FF;color:#1E40AF">กำลังส่งสรุป...</div>';try{await fetch('/api/daily-summary',{method:'POST'});document.getElementById('test-result').innerHTML='<div class="result" style="background:#F0FDF4;color:#065F46">\\u{1F389} ส่งสรุปงานแล้ว!</div>';}catch(e){document.getElementById('test-result').innerHTML='<div class="result" style="background:#FEF2F2;color:#991B1B">\\u274C '+e.message+'</div>';}}
 loadTasks();
-</script>
-</body>
-</html>`);
+</script></body></html>`);
 });
 
 // ========== API ==========
 app.post('/api/tasks', async (req, res) => {
   try {
-    const task = { id: genId(), ...req.body, status: 'sent', reply: null, createdAt: new Date().toISOString(), doneAt: null };
+    const task = { id: genId(), ...req.body, status: 'sent', reply: null, createdAt: new Date().toISOString(), doneAt: null, imageUrl: null };
+    if (req.body.imageBase64) { task.imageUrl = req.body.imageBase64; delete task.imageBase64; }
     tasks.push(task);
-    const cat = { urgent: '\\u{1F534} urgent', normal: '\\u{1F535} normal', question: '\\u{1F4AC} question', schedule: '\\u{1F4C5} schedule' };
-    let msg = (cat[task.category]||'task')+'\\n━━━━━━━━━━━━━━\\n\\u{1F4CC} '+task.title+'\\n';
-    if (task.detail) msg += '\\u{1F4DD} '+task.detail+'\\n';
-    if (task.dueDate) msg += '\\u23F0 due: '+task.dueDate+' '+(task.dueTime||'')+'\\n';
-    if (task.from) msg += '\\u{1F464} from: '+task.from+'\\n';
-    msg += '━━━━━━━━━━━━━━\\n';
-    msg += task.category==='question' ? '\\u{1F4AC} reply: type "reply '+task.id.slice(-4)+': [answer]"' : '\\u2705 done: type "done '+task.id.slice(-4)+'"';
-    await pushLine(BOSS, msg);
+
+    let msg = (CL[task.category]||'งาน')+'\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n';
+    if (task.detail) msg += '\u{1F4DD} '+task.detail+'\n';
+    if (task.dueDate) msg += '\u23F0 กำหนด: '+task.dueDate+' '+(task.dueTime||'')+'\n';
+    if (task.from) msg += '\u{1F464} จาก: '+task.from+'\n';
+    msg += '━━━━━━━━━━━━━━\n';
+    const isQ = task.category === 'question';
+    msg += isQ ? '\u{1F4AC} ตอบ: กดปุ่ม "ตอบ" ด้านล่าง' : '\u2705 เสร็จ: กดปุ่ม "เสร็จ" ด้านล่าง';
+    if (task.imageUrl) msg += '\n\u{1F4F7} (มีรูปแนบ — ดูในเว็บ)';
+
+    // Quick Reply button for this specific task
+    const qr = { items: [{
+      type: 'action',
+      action: { type: 'message', label: isQ ? '\u{1F4AC} ตอบคำถามนี้' : '\u2705 ทำเสร็จแล้ว', text: isQ ? 'ตอบ ' + task.id.slice(-4) + ': ' : 'เสร็จ ' + task.id.slice(-4) }
+    }, {
+      type: 'action',
+      action: { type: 'message', label: '\u{1F4CB} ดูงานทั้งหมด', text: 'งาน' }
+    }] };
+
+    await pushLine(BOSS, [{ type: 'text', text: msg, quickReply: qr }]);
     res.json({ success: true, task });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -298,7 +293,7 @@ app.get('/api/tasks', (req, res) => res.json(tasks));
 
 app.patch('/api/tasks/:id', async (req, res) => {
   const task = tasks.find(t => t.id === req.params.id);
-  if (!task) return res.status(404).json({ error: 'Not found' });
+  if (!task) return res.status(404).json({ error: 'ไม่พบงาน' });
   if (req.body.status) task.status = req.body.status;
   if (req.body.reply) task.reply = req.body.reply;
   if (task.status === 'done' || task.status === 'replied') task.doneAt = new Date().toISOString();
@@ -314,9 +309,9 @@ app.post('/api/test-line', async (req, res) => {
   try {
     const target = req.body.target || 'boss';
     const userId = target === 'secretary' ? SEC : BOSS;
-    const name = target === 'secretary' ? 'poppy' : 'boss';
-    const ok = await pushLine(userId, '\\u{1F9EA} Test from Boss Task Manager\\n━━━━━━━━━━━━━━\\nsent to: '+name+'\\n'+fmtDate()+'\\n\\u2705 Connection successful!');
-    res.json({ success: ok, message: ok ? 'sent to '+name : 'failed' });
+    const name = target === 'secretary' ? 'เลขา (ป๊อปปี้)' : 'เจ้านาย';
+    const ok = await pushLine(userId, '\u{1F9EA} ทดสอบจาก Boss Task Manager\n━━━━━━━━━━━━━━\n\u{1F4E9} ส่งถึง: '+name+'\n\u23F0 '+fmtDate()+'\n\u2705 ระบบเชื่อมต่อสำเร็จ!');
+    res.json({ success: ok, message: ok ? 'ส่งถึง'+name+'แล้ว' : 'ส่งไม่สำเร็จ' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -328,56 +323,64 @@ app.post('/webhook', (req, res) => {
     const text = event.message.text.trim();
     const rt = event.replyToken;
 
-    if (text.startsWith('done') || text.startsWith('เสร็จ')) {
+    // ─── เสร็จ ───
+    if (text.startsWith('เสร็จ') || text.startsWith('done')) {
       const code = text.replace(/^(done|เสร็จ)\s*/i, '').trim();
       const task = tasks.find(t => t.id.slice(-4) === code && t.status !== 'done' && t.status !== 'replied');
       if (task) {
         task.status = 'done'; task.doneAt = new Date().toISOString();
         const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
-        await replyLine(rt, '\\u2705 "'+task.title+'" done!');
-        await pushLine(SEC, '\\u2705 Boss completed task\\n━━━━━━━━━━━━━━\\n\\u{1F4CC} '+task.title+'\\n'+(task.detail?'\\u{1F4DD} '+task.detail+'\\n':'')+'\\u23F0 done: '+fmtDate()+'\\n━━━━━━━━━━━━━━\\nremaining: '+remaining+' tasks');
-      } else { await replyLine(rt, '\\u274C Task "'+code+'" not found'); }
+        // ตอบเจ้านาย + ปุ่มดูงานที่เหลือ
+        const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
+        await replyLine(rt, [{ type: 'text', text: '\u2705 เรียบร้อย! "'+task.title+'" เสร็จแล้ว\n\u{1F4CB} งานค้างเหลือ: '+remaining+' รายการ', quickReply: qr }]);
+        // แจ้งเลขา
+        await pushLine(SEC, '\u2705 เจ้านายทำงานเสร็จแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n'+(task.detail?'\u{1F4DD} '+task.detail+'\n':'')+'\u23F0 เสร็จเมื่อ: '+fmtDate()+'\n━━━━━━━━━━━━━━\n\u{1F4CB} งานค้างคงเหลือ: '+remaining+' รายการ');
+      } else { await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบงานรหัส "'+code+'"' }]); }
       return;
     }
 
-    if (text.startsWith('reply') || text.startsWith('ตอบ')) {
+    // ─── ตอบ ───
+    if (text.startsWith('ตอบ') || text.startsWith('reply')) {
       const rest = text.replace(/^(reply|ตอบ)\s*/i, '').trim();
       const ci = rest.indexOf(':');
-      if (ci === -1) { await replyLine(rt, 'Format: reply XXXX: your answer'); return; }
+      if (ci === -1) { await replyLine(rt, [{ type: 'text', text: '\u2753 รูปแบบ: ตอบ XXXX: คำตอบ\nเช่น: ตอบ A1B2: อนุมัติครับ' }]); return; }
       const code = rest.slice(0, ci).trim();
       const reply = rest.slice(ci + 1).trim();
       const task = tasks.find(t => t.id.slice(-4) === code && t.category === 'question');
       if (task && reply) {
         task.status = 'replied'; task.reply = reply; task.doneAt = new Date().toISOString();
-        await replyLine(rt, '\\u{1F4AC} Reply sent!\\n\\u{1F4CC} '+task.title+'\\n\\u{1F4AC} "'+reply+'"');
-        await pushLine(SEC, '\\u{1F4AC} Boss replied\\n━━━━━━━━━━━━━━\\n\\u{1F4CC} '+task.title+'\\n\\u{1F4AC} Answer: '+reply+'\\n'+(task.from?'\\u{1F464} Asked by: '+task.from+'\\n':'')+'━━━━━━━━━━━━━━\\nForward answer to team!');
-      } else { await replyLine(rt, '\\u274C Question "'+code+'" not found'); }
+        const remaining = tasks.filter(t => t.status !== 'done' && t.status !== 'replied').length;
+        const qr = remaining > 0 ? { items: [{ type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานที่เหลือ', text: 'งาน' } }] } : undefined;
+        await replyLine(rt, [{ type: 'text', text: '\u{1F4AC} ส่งคำตอบเรียบร้อย!\n\u{1F4CC} '+task.title+'\n\u{1F4AC} "'+reply+'"\n\u{1F4E9} แจ้งเลขาแล้ว', quickReply: qr }]);
+        await pushLine(SEC, '\u{1F4AC} เจ้านายตอบคำถามแล้ว\n━━━━━━━━━━━━━━\n\u{1F4CC} '+task.title+'\n\u{1F4AC} คำตอบ: '+reply+'\n'+(task.from?'\u{1F464} ถามโดย: '+task.from+'\n':'')+'━━━━━━━━━━━━━━\n\u{1F4E9} ส่งต่อคำตอบให้ทีมได้เลย');
+      } else { await replyLine(rt, [{ type: 'text', text: '\u274C ไม่พบคำถามรหัส "'+code+'"' }]); }
       return;
     }
 
-    const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
-    let menu = '\\u{1F4CB} Pending: '+pending.length+'\\n━━━━━━━━━━━━━━\\n';
-    if (!pending.length) menu += '\\u{1F389} No pending tasks!\\n';
-    else pending.forEach((t, i) => { menu += (i+1)+'. '+(CATS_E[t.category]||'')+' '+t.title+' ['+t.id.slice(-4)+']\\n'; });
-    menu += '━━━━━━━━━━━━━━\\n"done XXXX" or "เสร็จ XXXX"\\n"reply XXXX: answer" or "ตอบ XXXX: คำตอบ"';
-    await replyLine(rt, menu);
+    // ─── ดูงาน / ข้อความอื่นๆ → แสดงรายการ + ปุ่มกด ───
+    await replyLine(rt, buildTaskListFlex());
   });
   res.json({ ok: true });
 });
-
-const CATS_E = { urgent: '\\u{1F534}', normal: '\\u{1F535}', question: '\\u{1F4AC}', schedule: '\\u{1F4C5}' };
 
 // ========== DAILY CRON ==========
 async function sendDailySummary() {
   const pending = tasks.filter(t => t.status !== 'done' && t.status !== 'replied');
   if (!pending.length) return;
-  let msg = '\\u{1F305} Daily Summary (08:30)\\n━━━━━━━━━━━━━━\\nPending: '+pending.length+'\\n\\n';
-  pending.forEach((t, i) => { msg += (i+1)+'. '+(CATS_E[t.category]||'')+' '+t.title+' ['+t.id.slice(-4)+']\\n'; });
-  msg += '\\n━━━━━━━━━━━━━━\\n"done [ID]" or "reply [ID]: answer"';
-  await pushLine(BOSS, msg);
-  await pushLine(SEC, '\\u{1F4E9} Copy of daily summary (sent to boss)\\n\\n'+msg);
+  let msg = '\u{1F305} สรุปงานประจำวัน (08:30)\n━━━━━━━━━━━━━━\n\u{1F4CB} งานค้าง '+pending.length+' รายการ\n\n';
+  pending.forEach((t, i) => { msg += (i+1)+'. '+(CE[t.category]||'')+' '+t.title+'\n'; });
+  msg += '\n━━━━━━━━━━━━━━\n\u{1F447} กดปุ่มด้านล่างเพื่อเลือกงาน';
+
+  // Quick Reply สำหรับสรุปประจำวัน
+  const qr = { items: [] };
+  pending.slice(0, 13).forEach(t => {
+    const isQ = t.category === 'question';
+    qr.items.push({ type: 'action', action: { type: 'message', label: (isQ?'\u{1F4AC}ตอบ ':'\u2705เสร็จ ')+t.title.slice(0,14), text: isQ?'ตอบ '+t.id.slice(-4)+': ':'เสร็จ '+t.id.slice(-4) } });
+  });
+
+  await pushLine(BOSS, [{ type: 'text', text: msg, quickReply: qr }]);
+  await pushLine(SEC, '\u{1F4E9} สำเนาสรุปงาน (ส่งเจ้านายแล้ว)\n\n'+msg);
 }
 
 cron.schedule('30 8 * * *', () => { sendDailySummary().catch(e => console.error(e)); }, { timezone: 'Asia/Bangkok' });
-
 app.listen(PORT, () => { console.log('Boss Task Manager running on port '+PORT); });
