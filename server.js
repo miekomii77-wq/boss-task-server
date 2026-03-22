@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 let tasks = [];
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*', methods: ['GET','POST','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json());
 
 // ─── Helper: send LINE push message ───
