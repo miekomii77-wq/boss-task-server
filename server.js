@@ -357,9 +357,8 @@ app.post('/api/tasks', async (req, res) => {
     msg += '━━━━━━━━━━━━━━\n';
     msg += isQ ? '\u{1F447} กดปุ่ม "ตอบคำถามนี้" ด้านล่าง' : '\u{1F447} กดปุ่ม "ทำเสร็จแล้ว" ด้านล่าง';
     const qr = { items: [{ type: 'action', action: { type: 'message', label: isQ ? '\u{1F4AC} ตอบคำถามนี้' : '\u2705 ทำเสร็จแล้ว', text: isQ ? 'ตอบ ' + task.id.slice(-4) : 'เสร็จ ' + task.id.slice(-4) } }, { type: 'action', action: { type: 'message', label: '\u{1F4CB} ดูงานทั้งหมด', text: 'งาน' } }] };
-    const lineMessages = [];
-    if (task.imageUrl) lineMessages.push({ type: 'image', originalContentUrl: task.imageUrl, previewImageUrl: task.imageUrl });
-    lineMessages.push({ type: 'text', text: msg, quickReply: qr });
+    if (task.imageUrl) msg += '\n\u{1F4F7} ดูรูปแนบ: ' + task.imageUrl;
+    const lineMessages = [{ type: 'text', text: msg, quickReply: qr }];
     await pushLine(BOSS, lineMessages);
     res.json({ success: true, task });
   } catch (err) { res.status(500).json({ error: err.message }); }
